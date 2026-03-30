@@ -1,0 +1,18 @@
+[project]
+name = "ghibli-prototype"
+version = "0.1.0"
+description = "Ghibli Art Generator — AWS Prototype using moto"
+authors = [
+    {name = "Jeff"}
+]
+readme = "README.md"
+requires-python = "^3.11"
+dependencies = [
+    "boto3 (>=1.42.78,<2.0.0)",
+    "moto[all] (>=5.1.22,<6.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
