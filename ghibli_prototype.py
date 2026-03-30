@@ -1,23 +1,26 @@
 """
 Ghibli Art Generator — AWS Prototype (moto)
 
-v6: S3 + DynamoDB + SQS + SNS + IAM + CloudWatch — Observability
+v7: Priya's Complete Journey — All Services Wired End-to-End
 
-In v5, everything works — but how would we know if something went wrong?
-If the worker Lambda crashes at 3am, who notices? If queue depth spikes
-to 10,000 messages, how do we know before users complain?
+This is the full prototype. Every AWS service from Weeks 6-9 of course
+20XWAA is wired together into one coherent flow:
 
-CloudWatch solves this with two capabilities:
-  - LOGS: Every Lambda writes structured log events. When debugging an
-    issue, these logs are the first place you look.
-  - ALARMS: Monitor metrics and fire when thresholds are breached.
-    "Queue depth > 100" could trigger auto-scaling or page an engineer.
+  Priya uploads a selfie → S3 stores it → SQS queues the job →
+  Lambda worker processes it → DynamoDB tracks the state →
+  SNS notifies Priya → she downloads her Ghibli art.
 
-New in this version:
-  - CloudWatch Log Groups for each Lambda function
-  - Log events written at key processing steps
-  - CloudWatch Alarm on SQS queue depth
-  - Logs retrieved and printed in verification step
+All secured by IAM least-privilege roles, observed by CloudWatch logs
+and alarms. Six AWS services, zero servers, fully serverless.
+
+Services used:
+  - S3         (Week 6) — object storage, presigned URLs
+  - Lambda     (Week 7) — serverless compute (simulated as functions)
+  - IAM        (Week 8) — least-privilege roles and policies
+  - DynamoDB   (Week 9) — NoSQL job metadata
+  - SQS        (Week 9) — decoupled job queue
+  - SNS        (Week 9) — pub-sub notifications
+  - CloudWatch (Week 7/8) — logs and alarms
 
 Run with:
     poetry run python ghibli_prototype.py
@@ -29,6 +32,7 @@ from moto import mock_aws
 import boto3
 import json
 import time
+import uuid
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -548,10 +552,13 @@ def step8_verify(s3, sqs, sns, dynamo, iam, logs, cw, queue_url, topic_arn, job_
         print(f"    Threshold: > {int(a['Threshold'])} messages → triggers alarm")
         print(f"    Description: {a['AlarmDescription']}")
 
-    print(f"\n  AWS Region: {REGION} (Mumbai)")
-    print(f"  Services used: S3, DynamoDB, SQS, SNS, IAM, CloudWatch (Logs + Alarms)")
+    print(f"\n  {'=' * 56}")
+    print(f"  SUCCESS — Priya's Ghibli art journey complete!")
+    print(f"  {'=' * 56}")
+    print(f"  Total services used: S3, SQS, SNS, DynamoDB, IAM,")
+    print(f"                       CloudWatch (Logs + Alarms)")
+    print(f"  AWS Region: {REGION} (Mumbai)")
     print(f"  All interactions mocked via moto — zero real AWS calls made.")
-    print(f"\n  SUCCESS — Priya's observable, monitored journey complete!")
 
 
 # ===========================================================================
@@ -567,7 +574,9 @@ def run():
     logs = boto3.client("logs", region_name=REGION)
     cw = boto3.client("cloudwatch", region_name=REGION)
 
-    job_id = "a1b2c3d4-5678-9abc-def0-123456789abc"
+    # In v1-v6, we used a fixed job_id for predictable output.
+    # Now we use a real UUID — every run produces a unique job.
+    job_id = str(uuid.uuid4())
 
     infra = step1_create_infrastructure(s3, dynamo, sqs, sns, iam, logs, cw)
     queue_url = infra["queue_url"]
