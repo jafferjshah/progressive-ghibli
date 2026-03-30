@@ -1,24 +1,23 @@
 """
 Ghibli Art Generator — AWS Prototype (moto)
 
-v4: S3 + DynamoDB + SQS + SNS — Pub-Sub Notifications
+v5: S3 + DynamoDB + SQS + SNS + IAM — Least Privilege
 
-In v3, processing completes silently — Priya has no idea her art is ready.
-She'd have to keep refreshing the app. SNS solves this: after the worker
-finishes, it publishes ONE message to an SNS topic. SNS then fans out
-to all subscribers — email, SMS, push notifications — simultaneously.
+In v4, our Lambdas can do anything — there are no permissions boundaries.
+In real AWS, a Lambda with no IAM restrictions could read every S3 bucket,
+delete DynamoDB tables, or send messages to any queue. That's a security
+nightmare.
 
-KEY DIFFERENCE: SQS vs SNS
-  - SQS = point-to-point. One consumer gets each message. Used for work
-    distribution (e.g., job queue).
-  - SNS = pub-sub broadcast. ALL subscribers get every message. Used for
-    notifications (e.g., "art is ready!").
-  They solve different problems and are often used together.
+IAM (Identity and Access Management) solves this with the PRINCIPLE OF
+LEAST PRIVILEGE: each Lambda gets exactly the permissions it needs and
+nothing more.
 
 New in this version:
-  - SNS topic 'ghibli-notifications' with email subscription
-  - Worker publishes completion notification via SNS
-  - Before/after verification on SNS subscriptions and publishes
+  - IAM role 'lambda-presign-role' — can only write to raw uploads + DynamoDB
+  - IAM role 'lambda-worker-role' — can read raw, write output, update DB,
+    poll SQS, publish SNS
+  - Before/after verification on IAM roles and policies
+  - Each role's policy printed to show exactly what's allowed
 
 Run with:
     poetry run python ghibli_prototype.py
@@ -43,6 +42,16 @@ TOPIC_NAME = "ghibli-notifications"
 USER_EMAIL = "priya@example.com"
 FILENAME = "priya-selfie.jpg"
 FAKE_IMAGE = b"\xff\xd8\xff\xe0" + b"\x00" * 1000  # Fake JPEG header + padding
+
+# IAM trust policy — allows Lambda service to assume the role
+LAMBDA_TRUST_POLICY = json.dumps({
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Principal": {"Service": "lambda.amazonaws.com"},
+        "Action": "sts:AssumeRole",
+    }],
+})
 
 
 def banner(step: int, title: str):
@@ -102,11 +111,23 @@ def show_sns_subscriptions(sns, topic_arn: str, label: str):
             print(f"    - {sub['Protocol']}: {sub['Endpoint']}")
 
 
+def show_iam_roles(iam, label: str):
+    """List IAM roles we created (filter to our lambda- prefix)."""
+    roles = iam.list_roles()["Roles"]
+    our_roles = [r for r in roles if r["RoleName"].startswith("lambda-")]
+    if not our_roles:
+        print(f"  [{label}] IAM roles (lambda-*): (none)")
+    else:
+        print(f"  [{label}] IAM roles (lambda-*):")
+        for role in our_roles:
+            print(f"    - {role['RoleName']}  (ARN: {role['Arn']})")
+
+
 # ---------------------------------------------------------------------------
-# STEP 1: Create Infrastructure — S3 + DynamoDB + SQS + SNS
+# STEP 1: Create Infrastructure — S3 + DynamoDB + SQS + SNS + IAM
 # ---------------------------------------------------------------------------
-def step1_create_infrastructure(s3, dynamo, sqs, sns) -> dict:
-    banner(1, "INFRASTRUCTURE SETUP — S3 + DynamoDB + SQS + SNS")
+def step1_create_infrastructure(s3, dynamo, sqs, sns, iam) -> dict:
+    banner(1, "INFRASTRUCTURE SETUP — S3 + DynamoDB + SQS + SNS + IAM")
 
     # Before
     existing_buckets = s3.list_buckets()["Buckets"]
@@ -117,6 +138,7 @@ def step1_create_infrastructure(s3, dynamo, sqs, sns) -> dict:
     print(f"  [BEFORE] DynamoDB tables: {existing_tables or '(none)'}")
     print(f"  [BEFORE] SQS queues: {existing_queues or '(none)'}")
     print(f"  [BEFORE] SNS topics: {[t['TopicArn'].split(':')[-1] for t in existing_topics] or '(none)'}")
+    show_iam_roles(iam, "BEFORE")
 
     # S3 buckets
     s3.create_bucket(
@@ -148,48 +170,114 @@ def step1_create_infrastructure(s3, dynamo, sqs, sns) -> dict:
     queue_url = response["QueueUrl"]
     print(f"  [OK] Created SQS queue: {QUEUE_NAME} (visibility timeout: 60s)")
 
-    # -----------------------------------------------------------------------
-    # SNS Topic + Email Subscription
-    # WHY SNS? After the worker finishes, we need to notify Priya. We could
-    # send an email directly from the worker code, but that tightly couples
-    # the worker to "email". What if we also want to send a push notification?
-    # Or an SMS? Or trigger another Lambda?
-    #
-    # SNS decouples the "something happened" event from "who cares about it".
-    # The worker publishes ONE message. SNS fans it out to ALL subscribers.
-    # Adding a new notification channel = adding a new subscription, not
-    # changing the worker code. This is the pub-sub pattern.
-    #
-    # In real AWS, subscribing an email endpoint sends a confirmation email
-    # that the user must click. In moto, it's confirmed automatically.
-    # -----------------------------------------------------------------------
+    # SNS topic + subscription
     topic_response = sns.create_topic(Name=TOPIC_NAME)
     topic_arn = topic_response["TopicArn"]
-    print(f"  [OK] Created SNS topic: {TOPIC_NAME}")
-    print(f"       ARN: {topic_arn}")
+    sns.subscribe(TopicArn=topic_arn, Protocol="email", Endpoint=USER_EMAIL)
+    print(f"  [OK] Created SNS topic: {TOPIC_NAME} + subscribed {USER_EMAIL}")
 
-    # Before subscription
-    show_sns_subscriptions(sns, topic_arn, "BEFORE subscribe")
+    # -----------------------------------------------------------------------
+    # IAM Roles — Least Privilege
+    #
+    # WHY IAM? Every AWS service call requires permission. Without IAM roles,
+    # you'd embed long-lived access keys in your code (terrible for security).
+    # IAM roles let Lambda "assume" temporary credentials scoped to exactly
+    # what it needs.
+    #
+    # PRINCIPLE OF LEAST PRIVILEGE: give each component the minimum
+    # permissions required to do its job.
+    #   - The presign Lambda only needs: PutObject on raw bucket + PutItem on DynamoDB
+    #   - The worker Lambda needs more: read raw, write output, update DB, poll SQS, publish SNS
+    #   - Neither Lambda can delete buckets, create tables, or access other accounts
+    #
+    # In real AWS, if a policy were missing, the call would fail with
+    # AccessDeniedException. Moto doesn't enforce this, but we create the
+    # roles and policies anyway to teach the pattern.
+    # -----------------------------------------------------------------------
 
-    sns.subscribe(
-        TopicArn=topic_arn,
-        Protocol="email",
-        Endpoint=USER_EMAIL,
+    # Role 1: lambda-presign-role
+    presign_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["s3:PutObject"],
+                "Resource": f"arn:aws:s3:::{RAW_BUCKET}/*",
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["dynamodb:PutItem"],
+                "Resource": f"arn:aws:dynamodb:*:*:table/{JOBS_TABLE}",
+            },
+        ],
+    }
+    iam.create_role(
+        RoleName="lambda-presign-role",
+        AssumeRolePolicyDocument=LAMBDA_TRUST_POLICY,
+        Description="Presign Lambda — can upload to raw bucket and create job records",
     )
-    print(f"  [OK] SNS email subscription: {USER_EMAIL}")
+    iam.put_role_policy(
+        RoleName="lambda-presign-role",
+        PolicyName="presign-permissions",
+        PolicyDocument=json.dumps(presign_policy),
+    )
+    print(f"  [OK] IAM role created: lambda-presign-role")
+    print(f"       Permissions: s3:PutObject on {RAW_BUCKET}/*, dynamodb:PutItem on {JOBS_TABLE}")
 
-    # After subscription
-    show_sns_subscriptions(sns, topic_arn, "AFTER subscribe")
+    # Role 2: lambda-worker-role
+    worker_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": f"arn:aws:s3:::{RAW_BUCKET}/*",
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:PutObject", "s3:GetObject"],
+                "Resource": f"arn:aws:s3:::{OUTPUT_BUCKET}/*",
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:GetItem"],
+                "Resource": f"arn:aws:dynamodb:*:*:table/{JOBS_TABLE}",
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
+                "Resource": f"arn:aws:sqs:*:*:{QUEUE_NAME}",
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["sns:Publish"],
+                "Resource": f"arn:aws:sns:*:*:{TOPIC_NAME}",
+            },
+        ],
+    }
+    iam.create_role(
+        RoleName="lambda-worker-role",
+        AssumeRolePolicyDocument=LAMBDA_TRUST_POLICY,
+        Description="Worker Lambda — processes images, updates state, sends notifications",
+    )
+    iam.put_role_policy(
+        RoleName="lambda-worker-role",
+        PolicyName="worker-permissions",
+        PolicyDocument=json.dumps(worker_policy),
+    )
+    print(f"  [OK] IAM role created: lambda-worker-role")
+    print(f"       Permissions: s3:Get/Put, dynamodb:Get/Put/Update, sqs:Receive/Delete, sns:Publish")
 
-    # After — all infrastructure
-    existing_buckets = s3.list_buckets()["Buckets"]
-    existing_tables = dynamo.list_tables()["TableNames"]
-    existing_queues = sqs.list_queues().get("QueueUrls", [])
-    existing_topics = sns.list_topics()["Topics"]
-    print(f"  [AFTER] Buckets: {[b['Name'] for b in existing_buckets]}")
-    print(f"  [AFTER] DynamoDB tables: {existing_tables}")
-    print(f"  [AFTER] SQS queues: {[q.split('/')[-1] for q in existing_queues]}")
-    print(f"  [AFTER] SNS topics: {[t['TopicArn'].split(':')[-1] for t in existing_topics]}")
+    # After
+    show_iam_roles(iam, "AFTER")
+
+    # Print full policies for inspection
+    print(f"\n  --- lambda-presign-role policy ---")
+    for stmt in presign_policy["Statement"]:
+        print(f"    {stmt['Action']}  →  {stmt['Resource']}")
+    print(f"  --- lambda-worker-role policy ---")
+    for stmt in worker_policy["Statement"]:
+        print(f"    {stmt['Action']}  →  {stmt['Resource']}")
 
     return {"queue_url": queue_url, "topic_arn": topic_arn}
 
@@ -205,6 +293,7 @@ def step2_generate_presigned_put(s3, dynamo, job_id: str) -> str:
 
     print(f"  Priya requests upload URL for: {FILENAME}")
     print(f"  job_id: {job_id}")
+    print(f"  (Executing as: lambda-presign-role)")
 
     show_job_record(dynamo, job_id, "BEFORE")
 
@@ -297,6 +386,7 @@ def step5_worker_processes_job(s3, sqs, dynamo, queue_url: str, job_id: str) -> 
     banner(5, "WORKER POLLS SQS AND PROCESSES JOB")
 
     now = datetime.now(timezone.utc).isoformat()
+    print(f"  (Executing as: lambda-worker-role)")
 
     show_queue_depth(sqs, queue_url, "BEFORE")
     show_job_record(dynamo, job_id, "BEFORE")
@@ -374,13 +464,6 @@ def step5_worker_processes_job(s3, sqs, dynamo, queue_url: str, job_id: str) -> 
 # ---------------------------------------------------------------------------
 # STEP 6: SNS Notification to Priya
 # ---------------------------------------------------------------------------
-# The worker has finished. Now we publish to SNS. In a real system, the
-# worker Lambda would do this as its last step. We separate it here for
-# clarity — to show SNS as a distinct concept.
-#
-# One publish → all subscribers notified simultaneously. If we later add
-# an SMS subscriber or a webhook, the worker code doesn't change at all.
-# ---------------------------------------------------------------------------
 def step6_sns_notification(sns, topic_arn: str, job_id: str, download_url: str):
     banner(6, "SNS NOTIFICATION TO PRIYA")
 
@@ -391,6 +474,7 @@ def step6_sns_notification(sns, topic_arn: str, job_id: str, download_url: str):
     }
 
     print(f"  Publishing to SNS topic: {TOPIC_NAME}")
+    print(f"  (Executing as: lambda-worker-role — sns:Publish allowed)")
     print(f"  Payload:")
     print(f"    {json.dumps(notification_payload, indent=4)}")
 
@@ -432,7 +516,7 @@ def step7_download_output(s3, job_id: str):
 # ---------------------------------------------------------------------------
 # STEP 8: Verify End-to-End State
 # ---------------------------------------------------------------------------
-def step8_verify(s3, sqs, sns, dynamo, queue_url: str, topic_arn: str, job_id: str):
+def step8_verify(s3, sqs, sns, dynamo, iam, queue_url: str, topic_arn: str, job_id: str):
     banner(8, "VERIFY END-TO-END STATE")
 
     show_bucket_contents(s3, RAW_BUCKET, "FINAL")
@@ -442,12 +526,14 @@ def step8_verify(s3, sqs, sns, dynamo, queue_url: str, topic_arn: str, job_id: s
     print()
     show_sns_subscriptions(sns, topic_arn, "FINAL")
     print()
+    show_iam_roles(iam, "FINAL")
+    print()
     show_job_record(dynamo, job_id, "FINAL")
 
     print(f"\n  AWS Region: {REGION} (Mumbai)")
-    print(f"  Services used: S3, DynamoDB, SQS, SNS")
+    print(f"  Services used: S3, DynamoDB, SQS, SNS, IAM")
     print(f"  All interactions mocked via moto — zero real AWS calls made.")
-    print(f"\n  SUCCESS — Priya's full notification journey complete!")
+    print(f"\n  SUCCESS — Priya's secure, least-privilege journey complete!")
 
 
 # ===========================================================================
@@ -459,10 +545,11 @@ def run():
     dynamo = boto3.client("dynamodb", region_name=REGION)
     sqs = boto3.client("sqs", region_name=REGION)
     sns = boto3.client("sns", region_name=REGION)
+    iam = boto3.client("iam", region_name=REGION)
 
     job_id = "a1b2c3d4-5678-9abc-def0-123456789abc"
 
-    infra = step1_create_infrastructure(s3, dynamo, sqs, sns)
+    infra = step1_create_infrastructure(s3, dynamo, sqs, sns, iam)
     queue_url = infra["queue_url"]
     topic_arn = infra["topic_arn"]
 
@@ -472,7 +559,7 @@ def run():
     presigned_get_url = step5_worker_processes_job(s3, sqs, dynamo, queue_url, job_id)
     step6_sns_notification(sns, topic_arn, job_id, presigned_get_url)
     step7_download_output(s3, job_id)
-    step8_verify(s3, sqs, sns, dynamo, queue_url, topic_arn, job_id)
+    step8_verify(s3, sqs, sns, dynamo, iam, queue_url, topic_arn, job_id)
 
 
 if __name__ == "__main__":
