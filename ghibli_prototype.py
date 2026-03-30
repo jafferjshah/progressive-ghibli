@@ -1,21 +1,24 @@
 """
 Ghibli Art Generator — AWS Prototype (moto)
 
-v3: S3 + DynamoDB + SQS — Decoupled Processing
+v4: S3 + DynamoDB + SQS + SNS — Pub-Sub Notifications
 
-In v2, the upload and processing happened in the same flow — one function
-called the next directly. But what if 1000 Priyas upload selfies at once?
-The worker can't keep up, and requests get dropped.
+In v3, processing completes silently — Priya has no idea her art is ready.
+She'd have to keep refreshing the app. SNS solves this: after the worker
+finishes, it publishes ONE message to an SNS topic. SNS then fans out
+to all subscribers — email, SMS, push notifications — simultaneously.
 
-SQS solves this: the upload step puts a message on a queue, and the worker
-polls at its own pace. Messages wait safely in the queue — nothing is lost.
-This is the "decoupling" pattern.
+KEY DIFFERENCE: SQS vs SNS
+  - SQS = point-to-point. One consumer gets each message. Used for work
+    distribution (e.g., job queue).
+  - SNS = pub-sub broadcast. ALL subscribers get every message. Used for
+    notifications (e.g., "art is ready!").
+  They solve different problems and are often used together.
 
 New in this version:
-  - SQS queue 'ghibli-jobs-queue' between upload and processing
-  - S3 upload event simulated as SQS message
-  - Worker polls SQS, processes, then deletes the message
-  - Before/after queue depth verification at every step
+  - SNS topic 'ghibli-notifications' with email subscription
+  - Worker publishes completion notification via SNS
+  - Before/after verification on SNS subscriptions and publishes
 
 Run with:
     poetry run python ghibli_prototype.py
@@ -36,6 +39,7 @@ RAW_BUCKET = "ghibli-raw-uploads"
 OUTPUT_BUCKET = "ghibli-output"
 JOBS_TABLE = "jobs-metadata"
 QUEUE_NAME = "ghibli-jobs-queue"
+TOPIC_NAME = "ghibli-notifications"
 USER_EMAIL = "priya@example.com"
 FILENAME = "priya-selfie.jpg"
 FAKE_IMAGE = b"\xff\xd8\xff\xe0" + b"\x00" * 1000  # Fake JPEG header + padding
@@ -49,7 +53,7 @@ def banner(step: int, title: str):
 
 
 def show_bucket_contents(s3, bucket: str, label: str):
-    """List all objects in a bucket — used for before/after verification."""
+    """List all objects in a bucket."""
     response = s3.list_objects_v2(Bucket=bucket)
     objects = response.get("Contents", [])
     if not objects:
@@ -61,7 +65,7 @@ def show_bucket_contents(s3, bucket: str, label: str):
 
 
 def show_job_record(dynamo, job_id: str, label: str):
-    """Fetch and display a DynamoDB job record — used for before/after verification."""
+    """Fetch and display a DynamoDB job record."""
     response = dynamo.get_item(
         TableName=JOBS_TABLE,
         Key={"job_id": {"S": job_id}},
@@ -77,7 +81,7 @@ def show_job_record(dynamo, job_id: str, label: str):
 
 
 def show_queue_depth(sqs, queue_url: str, label: str):
-    """Show how many messages are waiting in the queue — before/after verification."""
+    """Show how many messages are waiting in the queue."""
     attrs = sqs.get_queue_attributes(
         QueueUrl=queue_url,
         AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"],
@@ -87,19 +91,32 @@ def show_queue_depth(sqs, queue_url: str, label: str):
     print(f"  [{label}] Queue '{QUEUE_NAME}': {visible} waiting, {in_flight} in-flight")
 
 
+def show_sns_subscriptions(sns, topic_arn: str, label: str):
+    """List all subscriptions on an SNS topic."""
+    subs = sns.list_subscriptions_by_topic(TopicArn=topic_arn)["Subscriptions"]
+    if not subs:
+        print(f"  [{label}] SNS topic '{TOPIC_NAME}': (no subscribers)")
+    else:
+        print(f"  [{label}] SNS topic '{TOPIC_NAME}' subscribers:")
+        for sub in subs:
+            print(f"    - {sub['Protocol']}: {sub['Endpoint']}")
+
+
 # ---------------------------------------------------------------------------
-# STEP 1: Create Infrastructure — S3 + DynamoDB + SQS
+# STEP 1: Create Infrastructure — S3 + DynamoDB + SQS + SNS
 # ---------------------------------------------------------------------------
-def step1_create_infrastructure(s3, dynamo, sqs) -> str:
-    banner(1, "INFRASTRUCTURE SETUP — S3 + DynamoDB + SQS")
+def step1_create_infrastructure(s3, dynamo, sqs, sns) -> dict:
+    banner(1, "INFRASTRUCTURE SETUP — S3 + DynamoDB + SQS + SNS")
 
     # Before
     existing_buckets = s3.list_buckets()["Buckets"]
     existing_tables = dynamo.list_tables()["TableNames"]
     existing_queues = sqs.list_queues().get("QueueUrls", [])
+    existing_topics = sns.list_topics()["Topics"]
     print(f"  [BEFORE] Buckets: {[b['Name'] for b in existing_buckets] or '(none)'}")
     print(f"  [BEFORE] DynamoDB tables: {existing_tables or '(none)'}")
     print(f"  [BEFORE] SQS queues: {existing_queues or '(none)'}")
+    print(f"  [BEFORE] SNS topics: {[t['TopicArn'].split(':')[-1] for t in existing_topics] or '(none)'}")
 
     # S3 buckets
     s3.create_bucket(
@@ -123,42 +140,58 @@ def step1_create_infrastructure(s3, dynamo, sqs) -> str:
     )
     print(f"  [OK] Created DynamoDB table: {JOBS_TABLE} (PAY_PER_REQUEST)")
 
-    # -----------------------------------------------------------------------
-    # SQS Queue — Standard (not FIFO)
-    # WHY SQS? The upload Lambda and the worker Lambda are decoupled via a
-    # queue. If Priya's upload triggers work directly (Lambda → Lambda), a
-    # burst of 1000 simultaneous uploads would overwhelm the worker. With
-    # SQS, messages accumulate in the queue and workers process at their own
-    # pace. This is the "decoupling" pattern — SQS absorbs the traffic spike.
-    #
-    # WHY Standard (not FIFO)? Order doesn't matter for image processing.
-    # Priya doesn't care if her job runs before or after someone else's.
-    # Standard queues have higher throughput and lower cost.
-    #
-    # Visibility timeout = 60s: once a worker picks up a message, it has 60
-    # seconds to finish. If it crashes, the message reappears for another
-    # worker to retry. This is how SQS provides at-least-once delivery.
-    # -----------------------------------------------------------------------
+    # SQS queue
     response = sqs.create_queue(
         QueueName=QUEUE_NAME,
-        Attributes={
-            "VisibilityTimeout": "60",
-        },
+        Attributes={"VisibilityTimeout": "60"},
     )
     queue_url = response["QueueUrl"]
-    print(f"  [OK] Created SQS queue: {QUEUE_NAME}")
-    print(f"       URL: {queue_url}")
-    print(f"       Visibility timeout: 60s")
+    print(f"  [OK] Created SQS queue: {QUEUE_NAME} (visibility timeout: 60s)")
 
-    # After
+    # -----------------------------------------------------------------------
+    # SNS Topic + Email Subscription
+    # WHY SNS? After the worker finishes, we need to notify Priya. We could
+    # send an email directly from the worker code, but that tightly couples
+    # the worker to "email". What if we also want to send a push notification?
+    # Or an SMS? Or trigger another Lambda?
+    #
+    # SNS decouples the "something happened" event from "who cares about it".
+    # The worker publishes ONE message. SNS fans it out to ALL subscribers.
+    # Adding a new notification channel = adding a new subscription, not
+    # changing the worker code. This is the pub-sub pattern.
+    #
+    # In real AWS, subscribing an email endpoint sends a confirmation email
+    # that the user must click. In moto, it's confirmed automatically.
+    # -----------------------------------------------------------------------
+    topic_response = sns.create_topic(Name=TOPIC_NAME)
+    topic_arn = topic_response["TopicArn"]
+    print(f"  [OK] Created SNS topic: {TOPIC_NAME}")
+    print(f"       ARN: {topic_arn}")
+
+    # Before subscription
+    show_sns_subscriptions(sns, topic_arn, "BEFORE subscribe")
+
+    sns.subscribe(
+        TopicArn=topic_arn,
+        Protocol="email",
+        Endpoint=USER_EMAIL,
+    )
+    print(f"  [OK] SNS email subscription: {USER_EMAIL}")
+
+    # After subscription
+    show_sns_subscriptions(sns, topic_arn, "AFTER subscribe")
+
+    # After — all infrastructure
     existing_buckets = s3.list_buckets()["Buckets"]
     existing_tables = dynamo.list_tables()["TableNames"]
     existing_queues = sqs.list_queues().get("QueueUrls", [])
+    existing_topics = sns.list_topics()["Topics"]
     print(f"  [AFTER] Buckets: {[b['Name'] for b in existing_buckets]}")
     print(f"  [AFTER] DynamoDB tables: {existing_tables}")
     print(f"  [AFTER] SQS queues: {[q.split('/')[-1] for q in existing_queues]}")
+    print(f"  [AFTER] SNS topics: {[t['TopicArn'].split(':')[-1] for t in existing_topics]}")
 
-    return queue_url
+    return {"queue_url": queue_url, "topic_arn": topic_arn}
 
 
 # ---------------------------------------------------------------------------
@@ -230,23 +263,13 @@ def step3_upload_selfie(s3, job_id: str):
 # ---------------------------------------------------------------------------
 # STEP 4: S3 Event → SQS Queue
 # ---------------------------------------------------------------------------
-# In real AWS, S3 can be configured to send an event notification to SQS
-# whenever an object is created. We simulate this manually: after the upload,
-# we construct the event payload and send it to the queue ourselves.
-#
-# KEY TEACHING POINT: SQS = point-to-point guaranteed delivery. One consumer
-# gets each message. If the consumer fails, the message reappears after the
-# visibility timeout. This is different from SNS (which we'll add in v4).
-# ---------------------------------------------------------------------------
 def step4_s3_event_to_sqs(sqs, queue_url: str, job_id: str):
     banner(4, "S3 EVENT → SQS QUEUE")
 
     input_key = f"{job_id}/original.jpg"
 
-    # Before — queue should be empty
     show_queue_depth(sqs, queue_url, "BEFORE")
 
-    # Construct the S3 event payload (this is what real S3 sends to SQS)
     event_payload = {
         "job_id": job_id,
         "user_email": USER_EMAIL,
@@ -255,7 +278,6 @@ def step4_s3_event_to_sqs(sqs, queue_url: str, job_id: str):
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    # Send message to SQS
     response = sqs.send_message(
         QueueUrl=queue_url,
         MessageBody=json.dumps(event_payload),
@@ -265,23 +287,13 @@ def step4_s3_event_to_sqs(sqs, queue_url: str, job_id: str):
     print(f"       Message ID: {message_id}")
     print(f"       Payload: {json.dumps(event_payload, indent=2)}")
 
-    # After — queue should have 1 message
     show_queue_depth(sqs, queue_url, "AFTER")
 
 
 # ---------------------------------------------------------------------------
-# STEP 5: Worker Polls SQS → Processes → Deletes Message
+# STEP 5: Worker Polls SQS → Processes → Updates DynamoDB
 # ---------------------------------------------------------------------------
-# The worker is a separate Lambda that polls SQS on a schedule. It:
-#   1. Receives a message (the job details)
-#   2. Processes the image
-#   3. Updates DynamoDB
-#   4. Deletes the message (acknowledges successful processing)
-#
-# If the worker crashes before deleting the message, it reappears after
-# the visibility timeout (60s) — this is SQS's retry mechanism.
-# ---------------------------------------------------------------------------
-def step5_worker_processes_job(s3, sqs, dynamo, queue_url: str, job_id: str):
+def step5_worker_processes_job(s3, sqs, dynamo, queue_url: str, job_id: str) -> str:
     banner(5, "WORKER POLLS SQS AND PROCESSES JOB")
 
     now = datetime.now(timezone.utc).isoformat()
@@ -289,16 +301,13 @@ def step5_worker_processes_job(s3, sqs, dynamo, queue_url: str, job_id: str):
     show_queue_depth(sqs, queue_url, "BEFORE")
     show_job_record(dynamo, job_id, "BEFORE")
 
-    # Worker polls SQS — receives up to 1 message
-    response = sqs.receive_message(
-        QueueUrl=queue_url,
-        MaxNumberOfMessages=1,
-    )
+    # Worker polls SQS
+    response = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1)
     messages = response.get("Messages", [])
 
     if not messages:
         print("  [ERROR] No messages in queue!")
-        return
+        return ""
 
     message = messages[0]
     receipt_handle = message["ReceiptHandle"]
@@ -352,25 +361,57 @@ def step5_worker_processes_job(s3, sqs, dynamo, queue_url: str, job_id: str):
     )
     print(f"  [OK] DynamoDB UpdateItem: status=PENDING → COMPLETE")
 
-    # -----------------------------------------------------------------------
-    # Delete the SQS message — this is the "acknowledgement"
-    # If we don't delete it, the message reappears after the visibility
-    # timeout and another worker would re-process the job (duplicate work).
-    # In production, you'd also want idempotency checks in the worker.
-    # -----------------------------------------------------------------------
+    # Delete the SQS message (acknowledge)
     sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
     print(f"  [OK] SQS message deleted (acknowledged)")
 
-    # After — queue should be empty, job should be COMPLETE
     show_queue_depth(sqs, queue_url, "AFTER")
     show_job_record(dynamo, job_id, "AFTER")
 
+    return presigned_get_url
+
 
 # ---------------------------------------------------------------------------
-# STEP 6: Download Output
+# STEP 6: SNS Notification to Priya
 # ---------------------------------------------------------------------------
-def step6_download_output(s3, job_id: str):
-    banner(6, "PRIYA DOWNLOADS HER GHIBLI ART — Presigned GET URL")
+# The worker has finished. Now we publish to SNS. In a real system, the
+# worker Lambda would do this as its last step. We separate it here for
+# clarity — to show SNS as a distinct concept.
+#
+# One publish → all subscribers notified simultaneously. If we later add
+# an SMS subscriber or a webhook, the worker code doesn't change at all.
+# ---------------------------------------------------------------------------
+def step6_sns_notification(sns, topic_arn: str, job_id: str, download_url: str):
+    banner(6, "SNS NOTIFICATION TO PRIYA")
+
+    notification_payload = {
+        "message": "Your Ghibli art is ready!",
+        "download_url": download_url[:80] + "...",
+        "job_id": job_id,
+    }
+
+    print(f"  Publishing to SNS topic: {TOPIC_NAME}")
+    print(f"  Payload:")
+    print(f"    {json.dumps(notification_payload, indent=4)}")
+
+    response = sns.publish(
+        TopicArn=topic_arn,
+        Subject="Your Ghibli art is ready!",
+        Message=json.dumps(notification_payload),
+    )
+    message_id = response["MessageId"]
+    print(f"\n  [OK] SNS message published")
+    print(f"       Message ID: {message_id}")
+    print(f"  [OK] Simulated email to {USER_EMAIL}:")
+    print(f'       Subject: "Your Ghibli art is ready!"')
+    print(f"       Body: Your Ghibli art is ready! Download: {download_url[:60]}...")
+
+
+# ---------------------------------------------------------------------------
+# STEP 7: Download Output
+# ---------------------------------------------------------------------------
+def step7_download_output(s3, job_id: str):
+    banner(7, "PRIYA DOWNLOADS HER GHIBLI ART — Presigned GET URL")
 
     output_key = f"{job_id}/ghibli-art.jpg"
 
@@ -389,22 +430,24 @@ def step6_download_output(s3, job_id: str):
 
 
 # ---------------------------------------------------------------------------
-# STEP 7: Verify End-to-End State
+# STEP 8: Verify End-to-End State
 # ---------------------------------------------------------------------------
-def step7_verify(s3, sqs, dynamo, queue_url: str, job_id: str):
-    banner(7, "VERIFY END-TO-END STATE")
+def step8_verify(s3, sqs, sns, dynamo, queue_url: str, topic_arn: str, job_id: str):
+    banner(8, "VERIFY END-TO-END STATE")
 
     show_bucket_contents(s3, RAW_BUCKET, "FINAL")
     show_bucket_contents(s3, OUTPUT_BUCKET, "FINAL")
     print()
     show_queue_depth(sqs, queue_url, "FINAL")
     print()
+    show_sns_subscriptions(sns, topic_arn, "FINAL")
+    print()
     show_job_record(dynamo, job_id, "FINAL")
 
     print(f"\n  AWS Region: {REGION} (Mumbai)")
-    print(f"  Services used: S3, DynamoDB, SQS")
+    print(f"  Services used: S3, DynamoDB, SQS, SNS")
     print(f"  All interactions mocked via moto — zero real AWS calls made.")
-    print(f"\n  SUCCESS — Priya's decoupled journey complete!")
+    print(f"\n  SUCCESS — Priya's full notification journey complete!")
 
 
 # ===========================================================================
@@ -415,16 +458,21 @@ def run():
     s3 = boto3.client("s3", region_name=REGION)
     dynamo = boto3.client("dynamodb", region_name=REGION)
     sqs = boto3.client("sqs", region_name=REGION)
+    sns = boto3.client("sns", region_name=REGION)
 
     job_id = "a1b2c3d4-5678-9abc-def0-123456789abc"
 
-    queue_url = step1_create_infrastructure(s3, dynamo, sqs)
+    infra = step1_create_infrastructure(s3, dynamo, sqs, sns)
+    queue_url = infra["queue_url"]
+    topic_arn = infra["topic_arn"]
+
     step2_generate_presigned_put(s3, dynamo, job_id)
     step3_upload_selfie(s3, job_id)
     step4_s3_event_to_sqs(sqs, queue_url, job_id)
-    step5_worker_processes_job(s3, sqs, dynamo, queue_url, job_id)
-    step6_download_output(s3, job_id)
-    step7_verify(s3, sqs, dynamo, queue_url, job_id)
+    presigned_get_url = step5_worker_processes_job(s3, sqs, dynamo, queue_url, job_id)
+    step6_sns_notification(sns, topic_arn, job_id, presigned_get_url)
+    step7_download_output(s3, job_id)
+    step8_verify(s3, sqs, sns, dynamo, queue_url, topic_arn, job_id)
 
 
 if __name__ == "__main__":
