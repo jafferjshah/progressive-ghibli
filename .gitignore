@@ -4,3 +4,4 @@ __pycache__/
 *.db
 dist/
 .venv/
+ghibli-aws-prototype-spec.md
