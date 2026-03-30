@@ -1,23 +1,23 @@
 """
 Ghibli Art Generator — AWS Prototype (moto)
 
-v5: S3 + DynamoDB + SQS + SNS + IAM — Least Privilege
+v6: S3 + DynamoDB + SQS + SNS + IAM + CloudWatch — Observability
 
-In v4, our Lambdas can do anything — there are no permissions boundaries.
-In real AWS, a Lambda with no IAM restrictions could read every S3 bucket,
-delete DynamoDB tables, or send messages to any queue. That's a security
-nightmare.
+In v5, everything works — but how would we know if something went wrong?
+If the worker Lambda crashes at 3am, who notices? If queue depth spikes
+to 10,000 messages, how do we know before users complain?
 
-IAM (Identity and Access Management) solves this with the PRINCIPLE OF
-LEAST PRIVILEGE: each Lambda gets exactly the permissions it needs and
-nothing more.
+CloudWatch solves this with two capabilities:
+  - LOGS: Every Lambda writes structured log events. When debugging an
+    issue, these logs are the first place you look.
+  - ALARMS: Monitor metrics and fire when thresholds are breached.
+    "Queue depth > 100" could trigger auto-scaling or page an engineer.
 
 New in this version:
-  - IAM role 'lambda-presign-role' — can only write to raw uploads + DynamoDB
-  - IAM role 'lambda-worker-role' — can read raw, write output, update DB,
-    poll SQS, publish SNS
-  - Before/after verification on IAM roles and policies
-  - Each role's policy printed to show exactly what's allowed
+  - CloudWatch Log Groups for each Lambda function
+  - Log events written at key processing steps
+  - CloudWatch Alarm on SQS queue depth
+  - Logs retrieved and printed in verification step
 
 Run with:
     poetry run python ghibli_prototype.py
@@ -28,6 +28,7 @@ No AWS credentials needed — everything is mocked via moto.
 from moto import mock_aws
 import boto3
 import json
+import time
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -43,7 +44,11 @@ USER_EMAIL = "priya@example.com"
 FILENAME = "priya-selfie.jpg"
 FAKE_IMAGE = b"\xff\xd8\xff\xe0" + b"\x00" * 1000  # Fake JPEG header + padding
 
-# IAM trust policy — allows Lambda service to assume the role
+# CloudWatch log group names — follows AWS Lambda convention
+LOG_GROUP_PRESIGN = "/aws/lambda/generate-presigned-url"
+LOG_GROUP_WORKER = "/aws/lambda/ghibli-style-worker"
+ALARM_NAME = "SQS-HighQueueDepth"
+
 LAMBDA_TRUST_POLICY = json.dumps({
     "Version": "2012-10-17",
     "Statement": [{
@@ -120,14 +125,48 @@ def show_iam_roles(iam, label: str):
     else:
         print(f"  [{label}] IAM roles (lambda-*):")
         for role in our_roles:
-            print(f"    - {role['RoleName']}  (ARN: {role['Arn']})")
+            print(f"    - {role['RoleName']}")
+
+
+def write_log(logs, log_group: str, stream: str, message: str):
+    """Write a log event to CloudWatch Logs."""
+    timestamp_ms = int(time.time() * 1000)
+    try:
+        logs.create_log_stream(logGroupName=log_group, logStreamName=stream)
+    except logs.exceptions.ResourceAlreadyExistsException:
+        pass
+    logs.put_log_events(
+        logGroupName=log_group,
+        logStreamName=stream,
+        logEvents=[{"timestamp": timestamp_ms, "message": message}],
+    )
+
+
+def show_log_events(logs, log_group: str, stream: str, label: str, limit: int = 5):
+    """Retrieve and display recent log events from a CloudWatch log stream."""
+    try:
+        response = logs.get_log_events(
+            logGroupName=log_group,
+            logStreamName=stream,
+            limit=limit,
+        )
+        events = response.get("events", [])
+        if not events:
+            print(f"  [{label}] {log_group}: (no events)")
+        else:
+            print(f"  [{label}] {log_group}:")
+            for event in events:
+                ts = datetime.fromtimestamp(event["timestamp"] / 1000, tz=timezone.utc)
+                print(f"    [{ts.strftime('%H:%M:%SZ')}] {event['message']}")
+    except Exception:
+        print(f"  [{label}] {log_group}: (no log stream)")
 
 
 # ---------------------------------------------------------------------------
-# STEP 1: Create Infrastructure — S3 + DynamoDB + SQS + SNS + IAM
+# STEP 1: Create Infrastructure
 # ---------------------------------------------------------------------------
-def step1_create_infrastructure(s3, dynamo, sqs, sns, iam) -> dict:
-    banner(1, "INFRASTRUCTURE SETUP — S3 + DynamoDB + SQS + SNS + IAM")
+def step1_create_infrastructure(s3, dynamo, sqs, sns, iam, logs, cw) -> dict:
+    banner(1, "INFRASTRUCTURE SETUP — All Services")
 
     # Before
     existing_buckets = s3.list_buckets()["Buckets"]
@@ -141,17 +180,9 @@ def step1_create_infrastructure(s3, dynamo, sqs, sns, iam) -> dict:
     show_iam_roles(iam, "BEFORE")
 
     # S3 buckets
-    s3.create_bucket(
-        Bucket=RAW_BUCKET,
-        CreateBucketConfiguration={"LocationConstraint": REGION},
-    )
-    print(f"  [OK] Created bucket: {RAW_BUCKET} (STANDARD storage, {REGION})")
-
-    s3.create_bucket(
-        Bucket=OUTPUT_BUCKET,
-        CreateBucketConfiguration={"LocationConstraint": REGION},
-    )
-    print(f"  [OK] Created bucket: {OUTPUT_BUCKET} (STANDARD_IA intent, {REGION})")
+    s3.create_bucket(Bucket=RAW_BUCKET, CreateBucketConfiguration={"LocationConstraint": REGION})
+    s3.create_bucket(Bucket=OUTPUT_BUCKET, CreateBucketConfiguration={"LocationConstraint": REGION})
+    print(f"  [OK] Created S3 buckets: {RAW_BUCKET}, {OUTPUT_BUCKET}")
 
     # DynamoDB table
     dynamo.create_table(
@@ -160,15 +191,12 @@ def step1_create_infrastructure(s3, dynamo, sqs, sns, iam) -> dict:
         AttributeDefinitions=[{"AttributeName": "job_id", "AttributeType": "S"}],
         BillingMode="PAY_PER_REQUEST",
     )
-    print(f"  [OK] Created DynamoDB table: {JOBS_TABLE} (PAY_PER_REQUEST)")
+    print(f"  [OK] Created DynamoDB table: {JOBS_TABLE}")
 
     # SQS queue
-    response = sqs.create_queue(
-        QueueName=QUEUE_NAME,
-        Attributes={"VisibilityTimeout": "60"},
-    )
+    response = sqs.create_queue(QueueName=QUEUE_NAME, Attributes={"VisibilityTimeout": "60"})
     queue_url = response["QueueUrl"]
-    print(f"  [OK] Created SQS queue: {QUEUE_NAME} (visibility timeout: 60s)")
+    print(f"  [OK] Created SQS queue: {QUEUE_NAME}")
 
     # SNS topic + subscription
     topic_response = sns.create_topic(Name=TOPIC_NAME)
@@ -176,108 +204,77 @@ def step1_create_infrastructure(s3, dynamo, sqs, sns, iam) -> dict:
     sns.subscribe(TopicArn=topic_arn, Protocol="email", Endpoint=USER_EMAIL)
     print(f"  [OK] Created SNS topic: {TOPIC_NAME} + subscribed {USER_EMAIL}")
 
-    # -----------------------------------------------------------------------
-    # IAM Roles — Least Privilege
-    #
-    # WHY IAM? Every AWS service call requires permission. Without IAM roles,
-    # you'd embed long-lived access keys in your code (terrible for security).
-    # IAM roles let Lambda "assume" temporary credentials scoped to exactly
-    # what it needs.
-    #
-    # PRINCIPLE OF LEAST PRIVILEGE: give each component the minimum
-    # permissions required to do its job.
-    #   - The presign Lambda only needs: PutObject on raw bucket + PutItem on DynamoDB
-    #   - The worker Lambda needs more: read raw, write output, update DB, poll SQS, publish SNS
-    #   - Neither Lambda can delete buckets, create tables, or access other accounts
-    #
-    # In real AWS, if a policy were missing, the call would fail with
-    # AccessDeniedException. Moto doesn't enforce this, but we create the
-    # roles and policies anyway to teach the pattern.
-    # -----------------------------------------------------------------------
-
-    # Role 1: lambda-presign-role
+    # IAM roles (same as v5)
     presign_policy = {
         "Version": "2012-10-17",
         "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": ["s3:PutObject"],
-                "Resource": f"arn:aws:s3:::{RAW_BUCKET}/*",
-            },
-            {
-                "Effect": "Allow",
-                "Action": ["dynamodb:PutItem"],
-                "Resource": f"arn:aws:dynamodb:*:*:table/{JOBS_TABLE}",
-            },
+            {"Effect": "Allow", "Action": ["s3:PutObject"], "Resource": f"arn:aws:s3:::{RAW_BUCKET}/*"},
+            {"Effect": "Allow", "Action": ["dynamodb:PutItem"], "Resource": f"arn:aws:dynamodb:*:*:table/{JOBS_TABLE}"},
         ],
     }
-    iam.create_role(
-        RoleName="lambda-presign-role",
-        AssumeRolePolicyDocument=LAMBDA_TRUST_POLICY,
-        Description="Presign Lambda — can upload to raw bucket and create job records",
-    )
-    iam.put_role_policy(
-        RoleName="lambda-presign-role",
-        PolicyName="presign-permissions",
-        PolicyDocument=json.dumps(presign_policy),
-    )
-    print(f"  [OK] IAM role created: lambda-presign-role")
-    print(f"       Permissions: s3:PutObject on {RAW_BUCKET}/*, dynamodb:PutItem on {JOBS_TABLE}")
+    iam.create_role(RoleName="lambda-presign-role", AssumeRolePolicyDocument=LAMBDA_TRUST_POLICY)
+    iam.put_role_policy(RoleName="lambda-presign-role", PolicyName="presign-permissions", PolicyDocument=json.dumps(presign_policy))
 
-    # Role 2: lambda-worker-role
     worker_policy = {
         "Version": "2012-10-17",
         "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": ["s3:GetObject"],
-                "Resource": f"arn:aws:s3:::{RAW_BUCKET}/*",
-            },
-            {
-                "Effect": "Allow",
-                "Action": ["s3:PutObject", "s3:GetObject"],
-                "Resource": f"arn:aws:s3:::{OUTPUT_BUCKET}/*",
-            },
-            {
-                "Effect": "Allow",
-                "Action": ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:GetItem"],
-                "Resource": f"arn:aws:dynamodb:*:*:table/{JOBS_TABLE}",
-            },
-            {
-                "Effect": "Allow",
-                "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
-                "Resource": f"arn:aws:sqs:*:*:{QUEUE_NAME}",
-            },
-            {
-                "Effect": "Allow",
-                "Action": ["sns:Publish"],
-                "Resource": f"arn:aws:sns:*:*:{TOPIC_NAME}",
-            },
+            {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": f"arn:aws:s3:::{RAW_BUCKET}/*"},
+            {"Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject"], "Resource": f"arn:aws:s3:::{OUTPUT_BUCKET}/*"},
+            {"Effect": "Allow", "Action": ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:GetItem"], "Resource": f"arn:aws:dynamodb:*:*:table/{JOBS_TABLE}"},
+            {"Effect": "Allow", "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"], "Resource": f"arn:aws:sqs:*:*:{QUEUE_NAME}"},
+            {"Effect": "Allow", "Action": ["sns:Publish"], "Resource": f"arn:aws:sns:*:*:{TOPIC_NAME}"},
         ],
     }
-    iam.create_role(
-        RoleName="lambda-worker-role",
-        AssumeRolePolicyDocument=LAMBDA_TRUST_POLICY,
-        Description="Worker Lambda — processes images, updates state, sends notifications",
+    iam.create_role(RoleName="lambda-worker-role", AssumeRolePolicyDocument=LAMBDA_TRUST_POLICY)
+    iam.put_role_policy(RoleName="lambda-worker-role", PolicyName="worker-permissions", PolicyDocument=json.dumps(worker_policy))
+    print(f"  [OK] Created IAM roles: lambda-presign-role, lambda-worker-role")
+
+    # -----------------------------------------------------------------------
+    # CloudWatch Log Groups
+    # WHY CloudWatch Logs? When a Lambda runs, you can't SSH into it — it's
+    # serverless, there's no server to access. CloudWatch Logs is where ALL
+    # Lambda output goes. It's your only window into what happened.
+    #
+    # In real AWS, Lambda automatically creates log groups and writes
+    # stdout/stderr there. We create them explicitly to show the pattern.
+    # -----------------------------------------------------------------------
+    logs.create_log_group(logGroupName=LOG_GROUP_PRESIGN)
+    logs.create_log_group(logGroupName=LOG_GROUP_WORKER)
+    print(f"  [OK] Created CloudWatch log groups:")
+    print(f"       {LOG_GROUP_PRESIGN}")
+    print(f"       {LOG_GROUP_WORKER}")
+
+    # -----------------------------------------------------------------------
+    # CloudWatch Alarm — SQS Queue Depth
+    # WHY ALARMS? Logs tell you what happened in the past. Alarms tell you
+    # something is wrong RIGHT NOW. If the queue has 100+ messages, either
+    # the worker is down or traffic spiked beyond capacity.
+    #
+    # In production, this alarm could trigger:
+    #   - Auto-scaling (add more Lambda concurrency)
+    #   - PagerDuty alert (wake up the on-call engineer)
+    #   - SNS notification (email the ops team)
+    # -----------------------------------------------------------------------
+    cw.put_metric_alarm(
+        AlarmName=ALARM_NAME,
+        MetricName="ApproximateNumberOfMessagesVisible",
+        Namespace="AWS/SQS",
+        Statistic="Average",
+        Period=60,
+        EvaluationPeriods=1,
+        Threshold=100,
+        ComparisonOperator="GreaterThanThreshold",
+        Dimensions=[{"Name": "QueueName", "Value": QUEUE_NAME}],
+        AlarmDescription="Alert when queue depth exceeds 100 messages — worker may be down",
     )
-    iam.put_role_policy(
-        RoleName="lambda-worker-role",
-        PolicyName="worker-permissions",
-        PolicyDocument=json.dumps(worker_policy),
-    )
-    print(f"  [OK] IAM role created: lambda-worker-role")
-    print(f"       Permissions: s3:Get/Put, dynamodb:Get/Put/Update, sqs:Receive/Delete, sns:Publish")
+    print(f"  [OK] Created CloudWatch alarm: {ALARM_NAME} (threshold: >100 msgs)")
 
     # After
     show_iam_roles(iam, "AFTER")
-
-    # Print full policies for inspection
-    print(f"\n  --- lambda-presign-role policy ---")
-    for stmt in presign_policy["Statement"]:
-        print(f"    {stmt['Action']}  →  {stmt['Resource']}")
-    print(f"  --- lambda-worker-role policy ---")
-    for stmt in worker_policy["Statement"]:
-        print(f"    {stmt['Action']}  →  {stmt['Resource']}")
+    existing_groups = logs.describe_log_groups()["logGroups"]
+    print(f"  [AFTER] CloudWatch log groups: {[g['logGroupName'] for g in existing_groups]}")
+    alarms = cw.describe_alarms(AlarmNames=[ALARM_NAME])["MetricAlarms"]
+    print(f"  [AFTER] CloudWatch alarms: {[a['AlarmName'] for a in alarms]}")
 
     return {"queue_url": queue_url, "topic_arn": topic_arn}
 
@@ -285,17 +282,21 @@ def step1_create_infrastructure(s3, dynamo, sqs, sns, iam) -> dict:
 # ---------------------------------------------------------------------------
 # STEP 2: Generate Presigned PUT URL + Create Job Record
 # ---------------------------------------------------------------------------
-def step2_generate_presigned_put(s3, dynamo, job_id: str) -> str:
+def step2_generate_presigned_put(s3, dynamo, logs, job_id: str) -> str:
     banner(2, "PRIYA OPENS THE APP — Presigned URL + Job Record")
 
     input_key = f"{job_id}/original.jpg"
     now = datetime.now(timezone.utc).isoformat()
+    stream = f"invocation-{job_id[:8]}"
 
     print(f"  Priya requests upload URL for: {FILENAME}")
     print(f"  job_id: {job_id}")
     print(f"  (Executing as: lambda-presign-role)")
 
     show_job_record(dynamo, job_id, "BEFORE")
+
+    # Log: function invoked
+    write_log(logs, LOG_GROUP_PRESIGN, stream, f"Upload request received: email={USER_EMAIL}, filename={FILENAME}")
 
     presigned_put_url = s3.generate_presigned_url(
         "put_object",
@@ -318,6 +319,10 @@ def step2_generate_presigned_put(s3, dynamo, job_id: str) -> str:
     )
     print(f"  [OK] DynamoDB PutItem: job_id={job_id}, status=PENDING")
 
+    # Log: job created
+    write_log(logs, LOG_GROUP_PRESIGN, stream, f"Job created: job_id={job_id}, status=PENDING")
+    write_log(logs, LOG_GROUP_PRESIGN, stream, f"Presigned PUT URL generated, expires_in=300s")
+
     show_job_record(dynamo, job_id, "AFTER")
 
     return presigned_put_url
@@ -333,20 +338,13 @@ def step3_upload_selfie(s3, job_id: str):
 
     show_bucket_contents(s3, RAW_BUCKET, "BEFORE")
 
-    s3.put_object(
-        Bucket=RAW_BUCKET,
-        Key=input_key,
-        Body=FAKE_IMAGE,
-        ContentType="image/jpeg",
-    )
+    s3.put_object(Bucket=RAW_BUCKET, Key=input_key, Body=FAKE_IMAGE, ContentType="image/jpeg")
     print(f"\n  [OK] Uploaded {len(FAKE_IMAGE)} bytes to {RAW_BUCKET}/{input_key}")
 
     show_bucket_contents(s3, RAW_BUCKET, "AFTER")
 
     head = s3.head_object(Bucket=RAW_BUCKET, Key=input_key)
-    print(f"  [VERIFY] Content-Type: {head['ContentType']}")
-    print(f"  [VERIFY] Content-Length: {head['ContentLength']}")
-    print(f"  [VERIFY] ETag: {head['ETag']}")
+    print(f"  [VERIFY] Content-Type: {head['ContentType']}, Size: {head['ContentLength']}, ETag: {head['ETag']}")
 
 
 # ---------------------------------------------------------------------------
@@ -367,13 +365,8 @@ def step4_s3_event_to_sqs(sqs, queue_url: str, job_id: str):
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    response = sqs.send_message(
-        QueueUrl=queue_url,
-        MessageBody=json.dumps(event_payload),
-    )
-    message_id = response["MessageId"]
-    print(f"  [OK] SQS message sent")
-    print(f"       Message ID: {message_id}")
+    response = sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(event_payload))
+    print(f"  [OK] SQS message sent (ID: {response['MessageId']})")
     print(f"       Payload: {json.dumps(event_payload, indent=2)}")
 
     show_queue_depth(sqs, queue_url, "AFTER")
@@ -382,10 +375,11 @@ def step4_s3_event_to_sqs(sqs, queue_url: str, job_id: str):
 # ---------------------------------------------------------------------------
 # STEP 5: Worker Polls SQS → Processes → Updates DynamoDB
 # ---------------------------------------------------------------------------
-def step5_worker_processes_job(s3, sqs, dynamo, queue_url: str, job_id: str) -> str:
+def step5_worker_processes_job(s3, sqs, dynamo, logs, queue_url: str, job_id: str) -> str:
     banner(5, "WORKER POLLS SQS AND PROCESSES JOB")
 
     now = datetime.now(timezone.utc).isoformat()
+    stream = f"invocation-{job_id[:8]}"
     print(f"  (Executing as: lambda-worker-role)")
 
     show_queue_depth(sqs, queue_url, "BEFORE")
@@ -397,14 +391,16 @@ def step5_worker_processes_job(s3, sqs, dynamo, queue_url: str, job_id: str) -> 
 
     if not messages:
         print("  [ERROR] No messages in queue!")
+        write_log(logs, LOG_GROUP_WORKER, stream, "ERROR: No messages available in queue")
         return ""
 
     message = messages[0]
     receipt_handle = message["ReceiptHandle"]
     payload = json.loads(message["Body"])
-    print(f"\n  [OK] Received SQS message:")
-    print(f"       job_id: {payload['job_id']}")
-    print(f"       input_key: {payload['input_key']}")
+    print(f"\n  [OK] Received SQS message: job_id={payload['job_id']}")
+
+    # Log: job received
+    write_log(logs, LOG_GROUP_WORKER, stream, f"Job received: {payload['job_id']}")
 
     # Download original from S3
     input_key = payload["input_key"]
@@ -412,28 +408,24 @@ def step5_worker_processes_job(s3, sqs, dynamo, queue_url: str, job_id: str) -> 
     obj = s3.get_object(Bucket=RAW_BUCKET, Key=input_key)
     original_bytes = obj["Body"].read()
     print(f"  [OK] Downloaded original: {len(original_bytes)} bytes from {RAW_BUCKET}")
+    write_log(logs, LOG_GROUP_WORKER, stream, f"Downloaded original image: {len(original_bytes)} bytes")
 
     # Simulate style transfer
     metadata = f"GHIBLI_PROCESSED::job_id={job_id}::timestamp={now}::".encode()
     processed_bytes = metadata + original_bytes
     print(f"  [OK] Style transfer applied: {len(original_bytes)} → {len(processed_bytes)} bytes")
+    write_log(logs, LOG_GROUP_WORKER, stream, f"Ghibli style transfer complete: {len(processed_bytes)} bytes")
 
     # Upload processed image
     show_bucket_contents(s3, OUTPUT_BUCKET, "BEFORE")
-    s3.put_object(
-        Bucket=OUTPUT_BUCKET,
-        Key=output_key,
-        Body=processed_bytes,
-        ContentType="image/jpeg",
-    )
+    s3.put_object(Bucket=OUTPUT_BUCKET, Key=output_key, Body=processed_bytes, ContentType="image/jpeg")
     print(f"\n  [OK] Uploaded processed image to {OUTPUT_BUCKET}/{output_key}")
     show_bucket_contents(s3, OUTPUT_BUCKET, "AFTER")
+    write_log(logs, LOG_GROUP_WORKER, stream, f"Output uploaded to {OUTPUT_BUCKET}/{output_key}")
 
-    # Generate presigned GET URL for the output
+    # Generate presigned GET URL
     presigned_get_url = s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": OUTPUT_BUCKET, "Key": output_key},
-        ExpiresIn=3600,
+        "get_object", Params={"Bucket": OUTPUT_BUCKET, "Key": output_key}, ExpiresIn=3600,
     )
 
     # Update DynamoDB: PENDING → COMPLETE
@@ -443,13 +435,12 @@ def step5_worker_processes_job(s3, sqs, dynamo, queue_url: str, job_id: str) -> 
         UpdateExpression="SET #s = :s, output_key = :ok, output_url = :ou, completed_at = :ca",
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={
-            ":s": {"S": "COMPLETE"},
-            ":ok": {"S": output_key},
-            ":ou": {"S": presigned_get_url[:80] + "..."},
-            ":ca": {"S": now},
+            ":s": {"S": "COMPLETE"}, ":ok": {"S": output_key},
+            ":ou": {"S": presigned_get_url[:80] + "..."}, ":ca": {"S": now},
         },
     )
     print(f"  [OK] DynamoDB UpdateItem: status=PENDING → COMPLETE")
+    write_log(logs, LOG_GROUP_WORKER, stream, f"DynamoDB updated: status=COMPLETE")
 
     # Delete the SQS message (acknowledge)
     sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
@@ -464,8 +455,10 @@ def step5_worker_processes_job(s3, sqs, dynamo, queue_url: str, job_id: str) -> 
 # ---------------------------------------------------------------------------
 # STEP 6: SNS Notification to Priya
 # ---------------------------------------------------------------------------
-def step6_sns_notification(sns, topic_arn: str, job_id: str, download_url: str):
+def step6_sns_notification(sns, logs, topic_arn: str, job_id: str, download_url: str):
     banner(6, "SNS NOTIFICATION TO PRIYA")
+
+    stream = f"invocation-{job_id[:8]}"
 
     notification_payload = {
         "message": "Your Ghibli art is ready!",
@@ -474,21 +467,19 @@ def step6_sns_notification(sns, topic_arn: str, job_id: str, download_url: str):
     }
 
     print(f"  Publishing to SNS topic: {TOPIC_NAME}")
-    print(f"  (Executing as: lambda-worker-role — sns:Publish allowed)")
-    print(f"  Payload:")
-    print(f"    {json.dumps(notification_payload, indent=4)}")
+    print(f"  Payload: {json.dumps(notification_payload, indent=4)}")
 
     response = sns.publish(
         TopicArn=topic_arn,
         Subject="Your Ghibli art is ready!",
         Message=json.dumps(notification_payload),
     )
-    message_id = response["MessageId"]
-    print(f"\n  [OK] SNS message published")
-    print(f"       Message ID: {message_id}")
+    print(f"\n  [OK] SNS message published (ID: {response['MessageId']})")
     print(f"  [OK] Simulated email to {USER_EMAIL}:")
     print(f'       Subject: "Your Ghibli art is ready!"')
-    print(f"       Body: Your Ghibli art is ready! Download: {download_url[:60]}...")
+    print(f"       Body: Download your art: {download_url[:60]}...")
+
+    write_log(logs, LOG_GROUP_WORKER, stream, f"SNS notification published for job {job_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -500,9 +491,7 @@ def step7_download_output(s3, job_id: str):
     output_key = f"{job_id}/ghibli-art.jpg"
 
     presigned_get_url = s3.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": OUTPUT_BUCKET, "Key": output_key},
-        ExpiresIn=3600,
+        "get_object", Params={"Bucket": OUTPUT_BUCKET, "Key": output_key}, ExpiresIn=3600,
     )
     print(f"  [OK] Presigned GET URL generated (expires in 3600s)")
     print(f"       URL: {presigned_get_url[:80]}...")
@@ -516,8 +505,10 @@ def step7_download_output(s3, job_id: str):
 # ---------------------------------------------------------------------------
 # STEP 8: Verify End-to-End State
 # ---------------------------------------------------------------------------
-def step8_verify(s3, sqs, sns, dynamo, iam, queue_url: str, topic_arn: str, job_id: str):
+def step8_verify(s3, sqs, sns, dynamo, iam, logs, cw, queue_url, topic_arn, job_id):
     banner(8, "VERIFY END-TO-END STATE")
+
+    stream = f"invocation-{job_id[:8]}"
 
     show_bucket_contents(s3, RAW_BUCKET, "FINAL")
     show_bucket_contents(s3, OUTPUT_BUCKET, "FINAL")
@@ -530,10 +521,37 @@ def step8_verify(s3, sqs, sns, dynamo, iam, queue_url: str, topic_arn: str, job_
     print()
     show_job_record(dynamo, job_id, "FINAL")
 
+    # -----------------------------------------------------------------------
+    # CloudWatch Logs — retrieve what each Lambda logged
+    # In real AWS, you'd use CloudWatch Logs Insights to search across
+    # thousands of invocations. Here we read the stream directly.
+    # -----------------------------------------------------------------------
+    print()
+    show_log_events(logs, LOG_GROUP_PRESIGN, stream, "LOGS")
+    print()
+    show_log_events(logs, LOG_GROUP_WORKER, stream, "LOGS")
+
+    # -----------------------------------------------------------------------
+    # CloudWatch Alarm status
+    # We manually set the alarm to OK to simulate a healthy system.
+    # In real AWS, CloudWatch evaluates the metric automatically.
+    # -----------------------------------------------------------------------
+    cw.set_alarm_state(
+        AlarmName=ALARM_NAME,
+        StateValue="OK",
+        StateReason="Queue depth within normal range",
+    )
+    alarm_status = cw.describe_alarms(AlarmNames=[ALARM_NAME])["MetricAlarms"]
+    if alarm_status:
+        a = alarm_status[0]
+        print(f"\n  CloudWatch Alarm '{a['AlarmName']}': {a['StateValue']}")
+        print(f"    Threshold: > {int(a['Threshold'])} messages → triggers alarm")
+        print(f"    Description: {a['AlarmDescription']}")
+
     print(f"\n  AWS Region: {REGION} (Mumbai)")
-    print(f"  Services used: S3, DynamoDB, SQS, SNS, IAM")
+    print(f"  Services used: S3, DynamoDB, SQS, SNS, IAM, CloudWatch (Logs + Alarms)")
     print(f"  All interactions mocked via moto — zero real AWS calls made.")
-    print(f"\n  SUCCESS — Priya's secure, least-privilege journey complete!")
+    print(f"\n  SUCCESS — Priya's observable, monitored journey complete!")
 
 
 # ===========================================================================
@@ -546,20 +564,22 @@ def run():
     sqs = boto3.client("sqs", region_name=REGION)
     sns = boto3.client("sns", region_name=REGION)
     iam = boto3.client("iam", region_name=REGION)
+    logs = boto3.client("logs", region_name=REGION)
+    cw = boto3.client("cloudwatch", region_name=REGION)
 
     job_id = "a1b2c3d4-5678-9abc-def0-123456789abc"
 
-    infra = step1_create_infrastructure(s3, dynamo, sqs, sns, iam)
+    infra = step1_create_infrastructure(s3, dynamo, sqs, sns, iam, logs, cw)
     queue_url = infra["queue_url"]
     topic_arn = infra["topic_arn"]
 
-    step2_generate_presigned_put(s3, dynamo, job_id)
+    step2_generate_presigned_put(s3, dynamo, logs, job_id)
     step3_upload_selfie(s3, job_id)
     step4_s3_event_to_sqs(sqs, queue_url, job_id)
-    presigned_get_url = step5_worker_processes_job(s3, sqs, dynamo, queue_url, job_id)
-    step6_sns_notification(sns, topic_arn, job_id, presigned_get_url)
+    presigned_get_url = step5_worker_processes_job(s3, sqs, dynamo, logs, queue_url, job_id)
+    step6_sns_notification(sns, logs, topic_arn, job_id, presigned_get_url)
     step7_download_output(s3, job_id)
-    step8_verify(s3, sqs, sns, dynamo, iam, queue_url, topic_arn, job_id)
+    step8_verify(s3, sqs, sns, dynamo, iam, logs, cw, queue_url, topic_arn, job_id)
 
 
 if __name__ == "__main__":
